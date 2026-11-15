@@ -2,6 +2,8 @@
 
 A standalone WiFi camera built on a Freenove ESP32-S3-WROOM board (N16R8 — 16MB flash, 8MB OPI PSRAM) with an OV3660 camera module. It doesn't need a home router: the board broadcasts its own access point, and any phone or laptop that joins it gets a live MJPEG stream and a simple photo gallery straight from the browser. A small touchscreen wired to the same board mirrors that same camera/gallery experience locally, so it also works as a self-contained handheld camera.
 
+Part of my project portfolio at [adrianmagallon.com](https://adrianmagallon.com/projects/ESP-CAM/).
+
 ## What it does
 
 - **Boots as its own WiFi access point** (`ESP32-S3-Cam`, open only to devices that know the password) instead of joining an existing network, so it works anywhere with no setup.
