@@ -3,3 +3,9 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# macOS Finder metadata
+.DS_Store
+
+# Local WiFi credentials (copy include/secrets.example.h)
+include/secrets.h
