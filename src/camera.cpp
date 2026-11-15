@@ -24,7 +24,10 @@
 // ── Tuning constants — adjust here, not buried in code ───────────
 #define CAM_XCLK_FREQ_HZ  20000000   // 20 MHz — safe default for OV3660
 #define CAM_JPEG_QUALITY  12         // more compression, smaller frames
-#define CAM_FRAME_SIZE    FRAMESIZE_VGA   // 480x320 — meaningful drop from VGA's 640x480
+#define CAM_FRAME_SIZE    FRAMESIZE_VGA   // 640x480. The local screen shrinks this to fit
+                                          // (see displayDrawJpeg). FRAMESIZE_HVGA (480x320)
+                                          // fills the panel's width instead, at the cost of
+                                          // lower-resolution saved photos.
 #define CAM_FB_COUNT      2          // Double-buffer: smoother stream, needs PSRAM
 
 bool initCamera() {

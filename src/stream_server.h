@@ -20,5 +20,10 @@ bool startServers();
  * same shared frame the WiFi stream and /capture read from — does NOT
  * talk to the camera driver directly. Returns false if no frame is
  * ready yet or the mutex was busy.
+ *
+ * lastSeq is optional: point it at a uint32_t you keep between calls
+ * (start it at 0) and this also returns false, without copying, when
+ * the latest frame is the same one you were given last time.
  */
-bool getLatestFrameForDisplay(uint8_t** buf, size_t* cap, size_t* outLen);
+bool getLatestFrameForDisplay(uint8_t** buf, size_t* cap, size_t* outLen,
+                              uint32_t* lastSeq = nullptr);

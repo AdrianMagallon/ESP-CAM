@@ -14,8 +14,17 @@ uint16_t displayHeight();
 /**
  * Fills the screen black. Needed before switching between UI views
  * (camera / gallery) so old content doesn't linger under the new view.
+ * If a viewport is set, only that rectangle is cleared.
  */
 void displayClear();
+
+/**
+ * Draws one line of text centred in the screen (or in the current
+ * viewport) — for things like "No photos yet" or a boot error. Doesn't
+ * clear anything first; call displayClear() if you need a blank
+ * background.
+ */
+void displayDrawMessage(const char* msg);
 
 /**
  * Restricts subsequent drawing (including displayDrawJpeg) to the given
@@ -46,7 +55,9 @@ void displayDrawToast(const char* msg);
 bool displayGetTouch(int16_t* outX, int16_t* outY);
 
 /**
- * Decodes a JPEG buffer straight to the screen. `brightness` is 0-255
+ * Decodes a JPEG buffer straight to the screen. The picture is shrunk
+ * (by 2, 4 or 8) if that's what it takes to fit the whole thing in the
+ * screen / current viewport, and centred there. `brightness` is 0-255
  * (255 = full brightness) — since our backlight has no PWM pin wired,
  * this fakes dimming by scaling the decoded pixel colors instead.
  */

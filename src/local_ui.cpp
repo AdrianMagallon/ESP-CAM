@@ -5,6 +5,7 @@
 #include "button.h"          // for buttonActivated() — physical TTP223 view toggle
 #include <SD_MMC.h>
 #include <string.h>
+#include "esp_heap_caps.h"
 #include <Arduino.h> // needed directly for int16_t/uint8_t and map() —
                      // don't rely on getting these secondhand through display.h
 
@@ -91,17 +92,18 @@ static size_t   s_camCap         = 0;
 #define TOAST_DURATION_MS       1500 // capture — camera view redraws over it naturally
 #define TOAST_DURATION_FAST_MS  400  // delete — much faster, gallery has to clear it explicitly
 static char     s_toastMsg[32] = "";
-static uint32_t s_toastExpiry  = 0;
+static uint32_t s_toastExpiry  = 0; // 0 = no toast on screen
 
 // Draws immediately (so there's no lag waiting for the next scheduled
 // camera refresh) and stays visible until s_toastExpiry. In camera view,
 // the periodic refresh loop keeps redrawing it each frame until expiry,
-// then a normal camera frame draws through without it — no extra code
-// needed there. Gallery view has no such loop, so it explicitly checks
-// s_toastExpiry and redraws the photo to clear it (see updateLocalUI).
+// then clears the area once and carries on with plain frames. Gallery
+// view has no such loop, so it explicitly checks s_toastExpiry and
+// redraws the photo to clear it (see updateLocalUI).
 static void showToast(const char* msg, uint32_t durationMs = TOAST_DURATION_MS) {
   strlcpy(s_toastMsg, msg, sizeof(s_toastMsg));
   s_toastExpiry = millis() + durationMs;
+  if (s_toastExpiry == 0) s_toastExpiry = 1; // 0 is reserved for "no toast"
 
   displaySetViewport(0, 0, displayWidth(), displayHeight() - TOOLBAR_H);
   displayDrawToast(s_toastMsg);
@@ -109,47 +111,49 @@ static void showToast(const char* msg, uint32_t durationMs = TOAST_DURATION_MS) 
 }
 
 // ── Gallery view state ───────────────────────────────────────────────
-#define MAX_PHOTOS     64
-#define PHOTO_NAME_LEN 32
-static char     s_photoNames[MAX_PHOTOS][PHOTO_NAME_LEN];
+// The name list lives in PSRAM (allocated once in initLocalUI) — at 32
+// bytes a name it's too big to leave sitting in internal RAM.
+#define MAX_PHOTOS 1024
+static char   (*s_photoNames)[PHOTO_NAME_MAX] = nullptr;
 static int      s_photoCount     = 0;
 static int      s_photoIndex     = 0;
 static int      s_lastDrawnIndex = -1; // -1 forces a redraw on gallery entry
 static uint8_t* s_photoBuf       = nullptr;
 static size_t   s_photoCap       = 0;
 
-// Parses the JSON array listPhotos() returns (e.g.
-// ["photo_1.jpg","photo_2.jpg"]) into s_photoNames. Simple quote-scanning
-// is fine here since our filenames are machine-generated in storage.cpp
-// and never contain a stray '"'.
-static void refreshPhotoList() {
-  char* buf = (char*)malloc(4096);
-  if (buf == nullptr) {
-    Serial.println("[local_ui] refreshPhotoList: out of memory");
-    return;
-  }
+// A toast the gallery should show right after its next photo redraw.
+// Queued rather than drawn straight away because that redraw would wipe
+// it out before it was ever visible.
+static char     s_pendingToast[32]   = "";
+static uint32_t s_pendingToastMs     = 0;
 
-  listPhotos(buf, 4096);
+static void queueToast(const char* msg, uint32_t durationMs) {
+  strlcpy(s_pendingToast, msg, sizeof(s_pendingToast));
+  s_pendingToastMs = durationMs;
+}
 
-  s_photoCount = 0;
-  char* p = buf;
-  while (*p && s_photoCount < MAX_PHOTOS) {
-    char* start = strchr(p, '"');
-    if (start == nullptr) break;
-    start++;
-    char* end = strchr(start, '"');
-    if (end == nullptr) break;
-
-    size_t len = end - start;
-    if (len >= PHOTO_NAME_LEN) len = PHOTO_NAME_LEN - 1;
-    memcpy(s_photoNames[s_photoCount], start, len);
-    s_photoNames[s_photoCount][len] = '\0';
+static bool collectPhotoName(const char* name, void* ctx) {
+  if (s_photoCount < MAX_PHOTOS) {
+    strlcpy(s_photoNames[s_photoCount], name, PHOTO_NAME_MAX);
     s_photoCount++;
-
-    p = end + 1;
   }
+  return true; // keep going even when full, so we learn the real total
+}
 
-  free(buf);
+// Reads the photo names straight from storage into s_photoNames.
+static void refreshPhotoList() {
+  s_photoCount = 0;
+
+  if (s_photoNames != nullptr) {
+    int total = forEachPhoto(collectPhotoName, nullptr);
+    if (total > s_photoCount) {
+      Serial.printf("[local_ui] Gallery: %d photos on card, only showing the first %d\n",
+                    total, s_photoCount);
+      char msg[32];
+      snprintf(msg, sizeof(msg), "Showing first %d of %d", s_photoCount, total);
+      queueToast(msg, TOAST_DURATION_MS);
+    }
+  }
 
   if (s_photoIndex >= s_photoCount) {
     s_photoIndex = (s_photoCount > 0) ? s_photoCount - 1 : 0;
@@ -195,9 +199,35 @@ static bool loadPhotoBytes(const char* filename, size_t* outLen) {
   return true;
 }
 
+// Draws the current gallery photo in the area above the toolbar — or a
+// line of text saying why there isn't one. Clipped to that area, so the
+// toolbar never needs redrawing afterwards.
+static void drawGalleryPhoto() {
+  displaySetViewport(0, 0, displayWidth(), displayHeight() - TOOLBAR_H);
+  displayClear();
+
+  if (!storageAvailable()) {
+    displayDrawMessage("No SD card");
+  } else if (s_photoCount == 0) {
+    displayDrawMessage("No photos yet");
+  } else {
+    size_t len = 0;
+    if (loadPhotoBytes(s_photoNames[s_photoIndex], &len)) {
+      displayDrawJpeg(s_photoBuf, len, 255);
+    } else {
+      Serial.printf("[local_ui] Failed to load %s\n", s_photoNames[s_photoIndex]);
+      displayDrawMessage("Can't open photo");
+    }
+  }
+
+  displayResetViewport();
+}
+
 // ── View transitions ─────────────────────────────────────────────────
 static void enterCameraView() {
   s_view = VIEW_CAMERA;
+  s_toastExpiry     = 0; // a toast from the other view doesn't carry over
+  s_pendingToast[0] = '\0';
   displayClear();
   s_lastCameraDraw = 0; // force an immediate frame draw on the next update
   drawCameraToolbar();
@@ -205,6 +235,8 @@ static void enterCameraView() {
 
 static void enterGalleryView() {
   s_view = VIEW_GALLERY;
+  s_toastExpiry     = 0;
+  s_pendingToast[0] = '\0';
   displayClear();
   refreshPhotoList();
   drawGalleryToolbar();
@@ -212,8 +244,17 @@ static void enterGalleryView() {
 
 // ── Public API ────────────────────────────────────────────────────────
 void initLocalUI() {
+  size_t listBytes = (size_t)MAX_PHOTOS * PHOTO_NAME_MAX;
+  s_photoNames = (char (*)[PHOTO_NAME_MAX])heap_caps_malloc(listBytes, MALLOC_CAP_SPIRAM);
+  if (s_photoNames == nullptr) {
+    s_photoNames = (char (*)[PHOTO_NAME_MAX])malloc(listBytes); // no PSRAM — try internal RAM
+  }
+  if (s_photoNames == nullptr) {
+    Serial.println("[local_ui] Couldn't allocate the gallery list — gallery will show as empty");
+  }
+
   layoutButtons();
-  drawCameraToolbar();
+  enterCameraView(); // clears whatever boot text is still on screen
 }
 
 void updateLocalUI() {
@@ -241,11 +282,18 @@ void updateLocalUI() {
         // can't paint over the buttons — means we no longer have to
         // redraw the toolbar every single refresh, just once on entry.
         displaySetViewport(0, 0, displayWidth(), displayHeight() - TOOLBAR_H);
+
+        // Toast just ran out: wipe the area once. The camera image is
+        // centred and may not cover every pixel the toast did, so a
+        // plain frame on its own could leave a sliver of it behind.
+        if (s_toastExpiry != 0 && now >= s_toastExpiry) {
+          s_toastExpiry = 0;
+          displayClear();
+        }
+
         displayDrawJpeg(s_camBuf, len, 255);
-        // Redraw the toast on top for as long as it's still active —
-        // once s_toastExpiry passes, a plain camera frame draws through
-        // and the toast disappears on its own, no manual clear needed.
-        if (now < s_toastExpiry) {
+        // Redraw the toast on top for as long as it's still active.
+        if (s_toastExpiry != 0) {
           displayDrawToast(s_toastMsg);
         }
         displayResetViewport();
@@ -255,11 +303,14 @@ void updateLocalUI() {
     if (tapped) {
       if (pointInButton(x, y, s_captureBtn)) {
         Serial.println("[local_ui] Capture button hit");
-        char name[48] = {};
+        char name[PHOTO_NAME_MAX] = {};
         size_t len = 0;
         // Same shared frame the web /capture endpoint reads from —
         // whatever's currently on screen is what gets saved.
-        if (getLatestFrameForDisplay(&s_camBuf, &s_camCap, &len) && len > 0) {
+        if (!storageAvailable()) {
+          Serial.println("[local_ui] Capture: no SD card");
+          showToast("No SD card");
+        } else if (getLatestFrameForDisplay(&s_camBuf, &s_camCap, &len) && len > 0) {
           if (savePhoto(s_camBuf, len, name, sizeof(name))) {
             Serial.printf("[local_ui] Saved %s\n", name);
             showToast("Photo saved");
@@ -280,9 +331,6 @@ void updateLocalUI() {
   }
 
   // ── Gallery view ──────────────────────────────────────────────────
-  bool justDeleted  = false;
-  bool deleteFailed = false;
-
   if (tapped) {
     if (pointInButton(x, y, s_backBtn)) {
       enterCameraView();
@@ -298,14 +346,14 @@ void updateLocalUI() {
     } else if (pointInButton(x, y, s_deleteBtn)) {
       if (s_photoCount > 0) {
         const char* name = s_photoNames[s_photoIndex];
-        if (deletePhoto(name)) {
+        bool deleted = deletePhoto(name);
+        if (deleted) {
           Serial.printf("[local_ui] Deleted %s\n", name);
-          justDeleted = true;
         } else {
           Serial.printf("[local_ui] Delete failed: %s\n", name);
-          deleteFailed = true;
         }
         refreshPhotoList(); // re-fetch — indices shift after a delete
+        queueToast(deleted ? "Deleted" : "Delete failed", TOAST_DURATION_FAST_MS);
       }
     }
   }
@@ -314,45 +362,23 @@ void updateLocalUI() {
   // JPEG decode are slow, no reason to redo them every loop iteration.
   if (s_photoIndex != s_lastDrawnIndex) {
     s_lastDrawnIndex = s_photoIndex;
-    displayClear();
-
-    if (s_photoCount == 0) {
-      Serial.println("[local_ui] Gallery is empty");
-    } else {
-      size_t len = 0;
-      if (loadPhotoBytes(s_photoNames[s_photoIndex], &len)) {
-        displayDrawJpeg(s_photoBuf, len, 255);
-      } else {
-        Serial.printf("[local_ui] Failed to load %s\n", s_photoNames[s_photoIndex]);
-      }
-    }
-
-    drawGalleryToolbar();
+    s_toastExpiry    = 0; // the redraw wipes any toast that was showing
+    drawGalleryPhoto();
   }
 
-  // Draw the delete toast AFTER the redraw above, not inside the tap
-  // handler — refreshPhotoList() just forced a fresh photo draw this
-  // same tick, and drawing the toast beforehand would've gotten wiped
-  // out before it was ever visible.
-  if (justDeleted) {
-    showToast("Deleted", TOAST_DURATION_FAST_MS);
-  } else if (deleteFailed) {
-    showToast("Delete failed", TOAST_DURATION_FAST_MS);
+  // Show a queued toast AFTER the redraw above — drawing it any earlier
+  // would've gotten it wiped out before it was ever visible.
+  if (s_pendingToast[0] != '\0') {
+    showToast(s_pendingToast, s_pendingToastMs);
+    s_pendingToast[0] = '\0';
   }
 
   // Gallery has no periodic refresh loop like camera view does, so once
-  // the toast's short window is up, explicitly redraw the photo to wipe
-  // it — otherwise it'd just sit on screen forever. The s_toastExpiry
-  // reset to 0 stops this from firing again every loop after it clears.
+  // the toast's window is up, explicitly redraw the photo to wipe it —
+  // otherwise it'd just sit on screen forever. Resetting s_toastExpiry
+  // to 0 stops this from firing again every loop after it clears.
   if (s_toastExpiry != 0 && now >= s_toastExpiry) {
     s_toastExpiry = 0;
-    displayClear();
-    if (s_photoCount > 0) {
-      size_t len = 0;
-      if (loadPhotoBytes(s_photoNames[s_photoIndex], &len)) {
-        displayDrawJpeg(s_photoBuf, len, 255);
-      }
-    }
-    drawGalleryToolbar();
+    drawGalleryPhoto();
   }
 }

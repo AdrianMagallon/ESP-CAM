@@ -96,8 +96,10 @@ bool initDisplay() {
 
   tft.fillScreen(TFT_BLACK);
   tft.setCursor(20, 20);
-  tft.println("Hello, camera!");
+  tft.println("Starting...");
 
+  // Scale is picked per image in displayDrawJpeg() — this is just a
+  // sane starting value.
   TJpgDec.setJpgScale(1);
   TJpgDec.setSwapBytes(true);
   TJpgDec.setCallback(jpegOutputCallback);
@@ -109,8 +111,18 @@ bool initDisplay() {
 uint16_t displayWidth()  { return tft.width(); }
 uint16_t displayHeight() { return tft.height(); }
 
+// Respects the current viewport — with one set, only that rectangle is
+// cleared.
 void displayClear() {
   tft.fillScreen(TFT_BLACK);
+}
+
+void displayDrawMessage(const char* msg) {
+  tft.setTextColor(TFT_WHITE);
+  tft.setTextSize(2);
+  tft.setTextDatum(MC_DATUM); // x/y below are the middle of the text
+  tft.drawString(msg, tft.width() / 2, tft.height() / 2);
+  tft.setTextDatum(TL_DATUM); // back to the default for everything else
 }
 
 void displaySetViewport(int16_t x, int16_t y, int16_t w, int16_t h) {
@@ -179,5 +191,30 @@ bool displayGetTouch(int16_t* outX, int16_t* outY) {
 
 void displayDrawJpeg(const uint8_t* jpegBuf, size_t len, uint8_t brightness) {
   s_activeBrightness = brightness;
-  TJpgDec.drawJpg(0, 0, jpegBuf, len);
+
+  uint16_t jpgW = 0, jpgH = 0;
+  if (TJpgDec.getJpgSize(&jpgW, &jpgH, jpegBuf, len) != JDR_OK || jpgW == 0 || jpgH == 0) {
+    Serial.println("[display] Couldn't read JPEG header — not drawing");
+    return;
+  }
+
+  // The decoder can only shrink by 1, 2, 4 or 8. Pick the smallest
+  // shrink that makes the whole picture fit in the drawing area, then
+  // centre it — otherwise an image bigger than the screen just gets its
+  // right and bottom edges cut off.
+  int32_t areaW = tft.getViewportWidth();
+  int32_t areaH = tft.getViewportHeight();
+
+  uint8_t scale = 1;
+  while (scale < 8 && (jpgW / scale > areaW || jpgH / scale > areaH)) {
+    scale *= 2;
+  }
+  TJpgDec.setJpgScale(scale);
+
+  int32_t x = (areaW - jpgW / scale) / 2;
+  int32_t y = (areaH - jpgH / scale) / 2;
+  if (x < 0) x = 0;
+  if (y < 0) y = 0;
+
+  TJpgDec.drawJpg(x, y, jpegBuf, len);
 }

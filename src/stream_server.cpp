@@ -10,6 +10,9 @@
 
 // ── MJPEG multipart stream constants ─────────────────────────────────────
 #define PART_BOUNDARY "123456789000000000000987654321"
+
+// Block size for reading saved photos off the SD card in /photo
+#define PHOTO_READ_CHUNK 8192
 static const char* STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
 static const char* STREAM_BOUNDARY     = "\r\n--" PART_BOUNDARY "\r\n";
 static const char* STREAM_PART_HEADER  = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
@@ -292,7 +295,7 @@ static const char* ROOT_HTML = R"HTML(
     setTimeout(() => flash.classList.remove('active'), 80);
 
     try {
-      const res = await fetch('/capture');
+      const res = await fetch('/capture', { method: 'POST' });
       if (!res.ok) throw new Error('HTTP ' + res.status);
       showToast('Photo saved');
     } catch (e) {
@@ -356,12 +359,22 @@ static const char* ROOT_HTML = R"HTML(
 
   async function deleteSelected() {
     if (selected.size === 0) { showToast('Select photos first'); return; }
-    const count = selected.size;
+    let count = 0;
+    let failed = 0;
     for (const f of selected) {
-      await fetch('/delete?f=' + encodeURIComponent(f)).catch(() => {});
+      try {
+        const res = await fetch('/delete?f=' + encodeURIComponent(f), { method: 'POST' });
+        if (res.ok) count++; else failed++;
+      } catch {
+        failed++;
+      }
     }
     selected.clear();
-    showToast('Deleted ' + count + (count === 1 ? ' photo' : ' photos'));
+    if (failed > 0) {
+      showToast('Deleted ' + count + ', ' + failed + ' failed');
+    } else {
+      showToast('Deleted ' + count + (count === 1 ? ' photo' : ' photos'));
+    }
     loadPhotos();
   }
 
@@ -392,6 +405,10 @@ static uint8_t*          s_frame_buf     = nullptr; // grows as needed, lives in
 static size_t             s_frame_cap     = 0;
 static size_t             s_frame_len     = 0;
 static volatile bool      s_frame_ready   = false;
+// Goes up by one every time the capture task stores a new frame, so a
+// reader can tell "same frame as last time" from "new frame" and skip
+// the copy (and the network send) when nothing has changed.
+static uint32_t           s_frame_seq     = 0;
 
 // Runs on core 1, away from the WiFi/network stack on core 0. Its only job
 // is "grab a frame, copy it into the shared buffer, repeat" — it never
@@ -419,6 +436,7 @@ static void captureTask(void* param) {
         memcpy(s_frame_buf, fb->buf, fb->len);
         s_frame_len   = fb->len;
         s_frame_ready = true;
+        s_frame_seq++;
       }
       xSemaphoreGive(s_frame_mutex);
     }
@@ -433,10 +451,16 @@ static void captureTask(void* param) {
 // Copies whatever the newest frame is into the caller's own buffer, growing
 // it if needed. Keeping this copy local to the caller means the mutex only
 // has to be held for a fast memcpy, not for the entire network send.
-bool getLatestFrameForDisplay(uint8_t** buf, size_t* cap, size_t* outLen) {
+//
+// lastSeq is optional. Pass the same variable in on every call and this
+// returns false (without copying anything) until the capture task has
+// produced a frame newer than the one you got last time.
+bool getLatestFrameForDisplay(uint8_t** buf, size_t* cap, size_t* outLen, uint32_t* lastSeq) {
   bool ok = false;
+  if (s_frame_mutex == nullptr) return false; // capture pipeline not started yet
   if (xSemaphoreTake(s_frame_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
-    if (s_frame_ready && s_frame_len > 0) {
+    bool isNew = (lastSeq == nullptr) || (*lastSeq != s_frame_seq);
+    if (s_frame_ready && s_frame_len > 0 && isNew) {
       if (s_frame_len > *cap) {
         uint8_t* bigger = (uint8_t*)realloc(*buf, s_frame_len);
         if (bigger != nullptr) { *buf = bigger; *cap = s_frame_len; }
@@ -444,6 +468,7 @@ bool getLatestFrameForDisplay(uint8_t** buf, size_t* cap, size_t* outLen) {
       if (*buf != nullptr && s_frame_len <= *cap) {
         memcpy(*buf, s_frame_buf, s_frame_len);
         *outLen = s_frame_len;
+        if (lastSeq != nullptr) *lastSeq = s_frame_seq;
         ok = true;
       }
     }
@@ -506,12 +531,14 @@ static esp_err_t stream_handler(httpd_req_t* req) {
   // (much slower, network-speed-dependent) send below.
   uint8_t* local_buf = nullptr;
   size_t   local_cap = 0;
+  uint32_t last_seq  = 0; // sequence number of the last frame we sent
 
   while (true) {
     size_t len = 0;
-    if (!getLatestFrameForDisplay(&local_buf, &local_cap, &len) || len == 0) {
-      // Capture task hasn't produced a frame yet, or the mutex was busy —
-      // wait a beat and try again rather than spinning.
+    if (!getLatestFrameForDisplay(&local_buf, &local_cap, &len, &last_seq) || len == 0) {
+      // No frame newer than the one we already sent (or the mutex was
+      // busy) — wait a beat and try again rather than resending the same
+      // picture or spinning.
       vTaskDelay(pdMS_TO_TICKS(5));
       continue;
     }
@@ -532,22 +559,27 @@ static esp_err_t stream_handler(httpd_req_t* req) {
   return res;
 }
 
-// GET /capture — grab a frame and save it to flash
+// POST /capture — grab a frame and save it to the SD card
 static esp_err_t capture_handler(httpd_req_t* req) {
   static uint8_t* capture_buf = nullptr;
   static size_t   capture_cap = 0;
   size_t len = 0;
+
+  if (!storageAvailable()) {
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No SD card");
+    return ESP_FAIL;
+  }
 
   if (!getLatestFrameForDisplay(&capture_buf, &capture_cap, &len) || len == 0) {
     httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No frame available yet");
     return ESP_FAIL;
   }
 
-  char name[48] = {};
+  char name[PHOTO_NAME_MAX] = {};
   bool ok = savePhoto(capture_buf, len, name, sizeof(name));
 
   if (!ok) {
-    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Save to flash failed");
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Save to SD card failed");
     return ESP_FAIL;
   }
 
@@ -558,23 +590,39 @@ static esp_err_t capture_handler(httpd_req_t* req) {
 }
 
 // GET /photos — return JSON array of saved photo filenames
-static esp_err_t photos_handler(httpd_req_t* req) {
-  // Heap-allocate — avoid blowing the HTTP server task stack
-  char* buf = static_cast<char*>(malloc(4096));
-  if (buf == nullptr) {
-    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
-    return ESP_FAIL;
-  }
+//
+// Sent as a chunked response, one name at a time, so the list isn't
+// limited by the size of a buffer — it used to stop without warning once
+// 4 KB of names had been written.
+struct PhotoListCtx {
+  httpd_req_t* req;
+  bool         first;
+  esp_err_t    res;
+};
 
-  listPhotos(buf, 4096);
-  httpd_resp_set_type(req, "application/json");
-  httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
-  esp_err_t res = httpd_resp_sendstr(req, buf);
-  free(buf);
-  return res;
+static bool sendPhotoName(const char* name, void* ctx) {
+  PhotoListCtx* c = static_cast<PhotoListCtx*>(ctx);
+  char item[PHOTO_NAME_MAX + 4];
+  int n = snprintf(item, sizeof(item), "%s\"%s\"", c->first ? "" : ",", name);
+  c->first = false;
+  c->res = httpd_resp_send_chunk(c->req, item, n);
+  return c->res == ESP_OK; // stop walking the directory if the client went away
 }
 
-// GET /photo?f=<filename> — serve a saved JPEG from flash
+static esp_err_t photos_handler(httpd_req_t* req) {
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+
+  PhotoListCtx ctx = { req, true, ESP_OK };
+
+  ctx.res = httpd_resp_send_chunk(req, "[", 1);
+  if (ctx.res == ESP_OK) forEachPhoto(sendPhotoName, &ctx);
+  if (ctx.res == ESP_OK) ctx.res = httpd_resp_send_chunk(req, "]", 1);
+  if (ctx.res == ESP_OK) ctx.res = httpd_resp_send_chunk(req, nullptr, 0); // end chunked transfer
+  return ctx.res;
+}
+
+// GET /photo?f=<filename> — serve a saved JPEG from the SD card
 static esp_err_t photo_handler(httpd_req_t* req) {
   char query[96]    = {};
   char filename[48] = {};
@@ -585,8 +633,9 @@ static esp_err_t photo_handler(httpd_req_t* req) {
     return ESP_FAIL;
   }
 
-  // Reject anything that doesn't look like one of our files
-  if (strncmp(filename, "photo_", 6) != 0) {
+  // Reject anything that doesn't look like one of our files (wrong
+  // prefix, path separators, "..")
+  if (!isValidPhotoName(filename)) {
     httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid filename");
     return ESP_FAIL;
   }
@@ -594,9 +643,19 @@ static esp_err_t photo_handler(httpd_req_t* req) {
   char path[64];
   getPhotoPath(filename, path, sizeof(path));
 
-File f = SD_MMC.open(path, FILE_READ);
+  File f = SD_MMC.open(path, FILE_READ);
   if (!f) {
     httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Photo not found");
+    return ESP_FAIL;
+  }
+
+  // Heap-allocated — too big for the HTTP server task's stack, and
+  // reading the card in larger blocks is a lot faster than 512 bytes at
+  // a time.
+  uint8_t* buf = static_cast<uint8_t*>(malloc(PHOTO_READ_CHUNK));
+  if (buf == nullptr) {
+    f.close();
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
     return ESP_FAIL;
   }
 
@@ -604,19 +663,20 @@ File f = SD_MMC.open(path, FILE_READ);
   httpd_resp_set_hdr(req, "Cache-Control", "max-age=3600");
   httpd_resp_set_hdr(req, "Connection", "close"); // free the socket right after, don't hold it on keep-alive
 
-  uint8_t buf[512];
   esp_err_t res = ESP_OK;
   while (f.available() && res == ESP_OK) {
-    size_t n = f.read(buf, sizeof(buf));
-    if (n > 0) res = httpd_resp_send_chunk(req, (const char*)buf, n);
+    size_t n = f.read(buf, PHOTO_READ_CHUNK);
+    if (n == 0) break; // read error — don't spin on a file that won't give us more
+    res = httpd_resp_send_chunk(req, (const char*)buf, n);
   }
   f.close();
+  free(buf);
 
-  httpd_resp_send_chunk(req, nullptr, 0); // end chunked transfer
+  if (res == ESP_OK) res = httpd_resp_send_chunk(req, nullptr, 0); // end chunked transfer
   return res;
 }
 
-// GET /delete?f=<filename> — delete a saved photo from flash
+// POST /delete?f=<filename> — delete a saved photo from the SD card
 static esp_err_t delete_handler(httpd_req_t* req) {
   char query[96]    = {};
   char filename[48] = {};
@@ -624,6 +684,11 @@ static esp_err_t delete_handler(httpd_req_t* req) {
   if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
       httpd_query_key_value(query, "f", filename, sizeof(filename)) != ESP_OK) {
     httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing ?f=filename");
+    return ESP_FAIL;
+  }
+
+  if (!isValidPhotoName(filename)) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid filename");
     return ESP_FAIL;
   }
 
@@ -669,6 +734,10 @@ bool startServers() {
     // high here is what caused the stream server to fail to start last
     // time, so leaving real headroom this time rather than cutting it close.
     cfg.max_open_sockets = 4;
+    // When all the sockets are taken, drop the least recently used one
+    // instead of refusing the new connection — stops idle keep-alive
+    // connections from locking a client out.
+    cfg.lru_purge_enable = true;
 
     if (httpd_start(&s_api_httpd, &cfg) != ESP_OK) {
       Serial.println("[server] Failed to start API server on port 80");
@@ -676,10 +745,12 @@ bool startServers() {
     }
 
     register_route(s_api_httpd, "/",        HTTP_GET, root_handler);
-    register_route(s_api_httpd, "/capture", HTTP_GET, capture_handler);
+    // /capture and /delete change what's on the card, so they're POST —
+    // a browser prefetching or re-loading a link can't trigger them.
+    register_route(s_api_httpd, "/capture", HTTP_POST, capture_handler);
     register_route(s_api_httpd, "/photos",  HTTP_GET, photos_handler);
     register_route(s_api_httpd, "/photo",   HTTP_GET, photo_handler);
-    register_route(s_api_httpd, "/delete",  HTTP_GET, delete_handler);
+    register_route(s_api_httpd, "/delete",  HTTP_POST, delete_handler);
     // /stream deliberately NOT registered here — it lives only on
     // s_stream_httpd below, on its own worker task.
 
@@ -696,6 +767,11 @@ bool startServers() {
     // plenty — and keeping it minimal leaves the most possible headroom
     // for the API server above.
     cfg.max_open_sockets = 1;
+    // Lets a new viewer take over the socket if the last one left it
+    // open but idle. It can't interrupt a stream that's actively being
+    // sent — the single worker is busy inside stream_handler until that
+    // client goes away.
+    cfg.lru_purge_enable = true;
 
     delay(500);
     if (httpd_start(&s_stream_httpd, &cfg) != ESP_OK) {
